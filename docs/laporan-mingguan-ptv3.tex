@@ -1,0 +1,438 @@
+% Compile with pdfLaTeX (two passes), or upload directly to Overleaf.
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{xurl}
+\usepackage[hidelinks]{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\renewcommand{\contentsname}{Daftar Isi}
+\renewcommand{\abstractname}{Ringkasan}
+\renewcommand{\tablename}{Tabel}
+\renewcommand{\refname}{Daftar Pustaka}
+\newcommand{\kode}[1]{\texttt{\detokenize{#1}}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\lstset{basicstyle=\ttfamily\small,breaklines=true,
+ frame=single,columns=fullflexible,keepspaces=true,
+ showstringspaces=false,backgroundcolor=\color{gray!5}}
+\setlength{\parskip}{0.45em}
+\setlength{\parindent}{0pt}
+\title{Laporan Kemajuan Mingguan\\
+ Pemetaan Fungsi Program dan Tuning Attention Patch Size\\
+ pada Point Transformer V3}
+\author{Nama: \textit{[isi nama]}\\
+ NIM: \textit{[isi NIM]}\\
+ Program studi: \textit{[isi program studi]}}
+\date{16 September 2026}
+
+\begin{document}
+\maketitle
+\begin{center}
+\textbf{Proyek:} Transformer-based Models for Geometric Deep Learning
+on Point-cloud Data\\
+\textbf{Periode eksperimen:} 13--15 September 2026
+\end{center}
+
+\begin{abstract}
+Laporan ini menyajikan pemetaan fungsi utama pipeline klasifikasi
+Point Transformer V3 (PTv3) pada framework Pointcept serta eksperimen
+tuning ukuran patch attention. Eksperimen menggunakan subset stratified
+ModelNet40 yang terdiri atas 798 objek training dan 202 objek validation.
+Seluruh konfigurasi menggunakan 1.024 titik per objek, seed 42, dan
+100 epoch. Ukuran patch encoder 128, 256, dan 512 dibandingkan dengan
+baseline 1024. Baseline mencapai validation overall accuracy tertinggi
+sebesar 75,25\%, sedangkan patch 256 mencapai 74,75\% dengan mean class
+accuracy sedikit lebih tinggi. Waktu training seluruh konfigurasi berada
+di sekitar 47--48 menit. Hasil satu seed ini belum menunjukkan peningkatan
+overall accuracy atau percepatan yang berarti akibat pengecilan patch.
+\end{abstract}
+\tableofcontents
+\newpage
+
+\section{Latar Belakang dan Tujuan}
+Point cloud memiliki susunan titik yang tidak mengikuti grid reguler.
+Model perlu mengolah fitur dan hubungan geometris tanpa bergantung pada
+urutan input yang arbitrer. PTv3 menggunakan serialized neighborhood
+mapping untuk membentuk kelompok attention secara efisien, sebagai
+alternatif pencarian neighborhood presisi berbasis KNN pada pipeline
+sebelumnya~\cite{ptv3}.
+
+Tujuan kegiatan minggu ini adalah:
+\begin{enumerate}
+\item Memetakan fungsi program, input, output, dan hubungan pemanggilan
+      dalam pipeline PTv3 untuk klasifikasi ModelNet40.
+\item Memahami serialization, proyeksi Query--Key--Value (QKV), patch
+      attention, hierarchical pooling, dan update parameter.
+\item Menguji pengaruh \kode{enc_patch_size} dengan kondisi eksperimen
+      lainnya tetap.
+\item Mendokumentasikan hasil validation dan durasi training sebagai
+      dasar eksperimen lanjutan.
+\end{enumerate}
+Kegiatan ini merupakan \textit{hyperparameter tuning}; model dilatih
+dari awal. Belum dilakukan fine-tuning dari pretrained checkpoint maupun
+modifikasi rumus QKV.
+
+\section{Pemetaan Struktur dan Fungsi Program}
+\subsection{Struktur repository}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Bagian & Fungsi utama \\
+\midrule
+\kode{configs/} & Parameter model, dataset, optimizer, scheduler, dan hooks. \\
+\kode{pointcept/datasets/} & Membaca data, sampling, dan transformasi. \\
+\kode{pointcept/models/} & Backbone PTv3, classification head, dan loss. \\
+\kode{pointcept/engines/} & Training, validation, testing, dan hooks. \\
+\kode{pointcept/utils/} & Config parser, logging, registry, dan optimizer. \\
+\kode{libs/} & Operasi tambahan point cloud berbasis C++/CUDA. \\
+\kode{tools/} & Entry point Python dan program pembentukan split dataset. \\
+\kode{scripts/} & Peluncur shell untuk training dan testing. \\
+\kode{data/} & Dataset dan daftar split; pada workspace ini berupa symlink. \\
+\kode{exp/} & Log, checkpoint, TensorBoard, config, dan snapshot kode. \\
+\bottomrule
+\end{tabularx}
+
+\subsection{Hubungan pemanggilan}
+\begin{lstlisting}
+scripts/train.sh
+  -> tools/train.py: main()
+  -> default_config_parser() -> launch() -> main_worker()
+  -> Trainer.__init__()
+     -> model, dataset, DataLoader, optimizer, scheduler
+  -> Trainer.train()
+     -> dataset.__getitem__() -> transforms -> batch
+     -> Trainer.run_step()
+        -> DefaultClassifier.forward()
+           -> PointTransformerV3.forward()
+           -> mean aggregation -> classification head -> loss
+        -> backward -> optimizer.step() -> scheduler.step()
+     -> validation -> save checkpoint
+  -> exp/modelnet40/<nama-eksperimen>/
+\end{lstlisting}
+\kode{scripts/train.sh} menyalin source code ke \kode{exp/.../code/}
+dan menjalankan snapshot tersebut. Perubahan source setelah training
+dimulai tidak otomatis mengubah proses yang sedang aktif.
+
+\subsection{Peta fungsi utama}
+Path yang diawali \kode{datasets/}, \kode{models/}, dan \kode{engines/}
+pada tabel berikut berada di dalam folder \kode{pointcept/}.
+\small
+\begin{longtable}{L{0.34\linewidth}L{0.27\linewidth}L{0.29\linewidth}}
+\caption{Peta fungsi utama pipeline klasifikasi PTv3.}\label{tab:functions}\\
+\toprule
+File / fungsi & Input dan proses & Output / efek \\
+\midrule
+\endfirsthead
+\toprule
+File / fungsi & Input dan proses & Output / efek \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\kode{tools/train.py: main()} & Membaca argumen CLI dan config; meluncurkan worker. & Proses training GPU. \\
+\kode{main_worker(cfg)} & Setup run; membangun trainer. & Memanggil \kode{trainer.train()}. \\
+\kode{engines/defaults.py: default_config_parser()} & Menggabungkan config dan override; menetapkan dataset loop. & Config run dan salinannya. \\
+\kode{default_setup()} & Menetapkan seed serta batch/worker per GPU. & Environment eksperimen. \\
+\kode{datasets/modelnet.py: get_data_list()} & Membaca \kode{modelnet40_<split>.txt}. & Daftar nama objek. \\
+\kode{ModelNetDataset.__init__()} & Root, split, jumlah titik, dan transform; membaca/membuat cache. & Dataset siap digunakan. \\
+\kode{get_data(idx)} & Cache atau file XYZ+normal; sampling titik; pembentukan label. & Dictionary koordinat, normal, kategori. \\
+\kode{__getitem__(idx)} & Memilih jalur persiapan train atau test. & Satu sampel. \\
+\kode{__len__()} & Jumlah objek dikalikan dataset loop. & Panjang dataset. \\
+\kode{prepare_train_data(idx)} & Mengambil data dan menerapkan transform. & Input train/validation. \\
+\kode{prepare_test_data(idx)} & Mengambil data dan membuat augmentasi test. & Voting list dan label. \\
+\kode{datasets/transform.py} & Normalisasi, scale, shift, grid sampling, konversi tensor. & Koordinat, grid coordinate, fitur dan label terpilih. \\
+\kode{models/default.py: DefaultClassifier.forward()} & Menjalankan backbone, mean aggregation per objek, head dan loss. & Loss saat train; logits dan loss sesuai mode evaluasi. \\
+\kode{models/utils/structure.py: Point.serialization()} & Grid coordinates, batch, dan metode ordering. & Serialized code, order, dan inverse. \\
+\kode{models/utils/serialization/default.py: encode()} & Memilih Z-order atau Hilbert; varian trans menukar x dan y. & Kode spasial integer. \\
+\kode{PointTransformerV3.forward()} & Serialization, sparsify, embedding dan encoder. & Fitur backbone dalam struktur Point. \\
+\kode{Embedding.forward()} & Fitur awal dan struktur sparse point cloud. & Fitur embedding awal. \\
+\kode{Block.forward()} & CPE, normalisasi, attention, MLP dan residual. & Fitur hasil transformer block. \\
+\kode{SerializedAttention.get_padding_and_inverse()} & Offset tiap objek dan patch size; membentuk padding. & pad, unpad dan cu\_seqlens. \\
+\kode{SerializedAttention.forward()} & Fitur terurut; proyeksi QKV, attention patch dan proyeksi output. & Fitur hasil attention. \\
+\kode{MLP.forward()} & Linear, GELU, linear dan dropout. & Fitur hasil feed-forward network. \\
+\kode{SerializedPooling.forward()} & Pengelompokan hierarkis dan agregasi fitur. & Lebih sedikit titik dengan fitur stage berikutnya. \\
+\kode{SerializedUnpooling.forward()} & Upsampling dan skip features pada decoder. & Resolusi lebih tinggi; tidak digunakan saat \kode{enc_mode=True}. \\
+\kode{engines/train.py: build_model()} & Membentuk model dari config dan menempatkannya di GPU. & Model trainable. \\
+\kode{build_train_loader()}, \kode{build_val_loader()} & Membentuk dataset, sampler, dan DataLoader. & Iterator batch. \\
+\kode{build_optimizer()}, \kode{build_scheduler()} & Parameter model dan config update bobot. & Optimizer dan scheduler. \\
+\kode{Trainer.train()} & Iterasi epoch/batch dan pemanggilan hooks. & Proses training lengkap. \\
+\kode{Trainer.run_step()} & Pemindahan batch ke CUDA, forward, backward dan update. & Bobot baru dan loss batch. \\
+\kode{hooks/evaluator.py: ClsEvaluator} & Prediksi pada validation loader. & allAcc, mAcc, F1 dan statistik kelas. \\
+\kode{hooks/misc.py: CheckpointSaver} & Epoch dan skor validation. & \kode{model_best.pth}, \kode{model_last.pth}. \\
+\kode{PreciseEvaluator.after_train()} & Checkpoint dan test config. & Testing otomatis setelah training. \\
+\kode{engines/test.py: ClsVotingTester.test()} & Model dan augmentasi objek test. & Hasil voting evaluation. \\
+\end{longtable}
+\normalsize
+Komponen backbone pada tabel terdapat di
+\path{pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py}.
+
+\subsection{QKV dan serialized attention}
+Untuk fitur $X$, proyeksi attention secara konseptual ditulis sebagai
+\begin{equation}
+Q=XW_Q+b_Q,\quad K=XW_K+b_K,\quad V=XW_V+b_V.
+\end{equation}
+Pada implementasi ini, ketiga proyeksi dikemas dalam satu layer linear
+\kode{Linear(channels, 3 * channels)}. Bobot proyeksi dipelajari selama
+training. Attention per head dalam satu patch secara konseptual adalah
+\begin{equation}
+\operatorname{Attention}(Q,K,V)=
+\operatorname{softmax}\left(\frac{QK^{\mathsf T}}{\sqrt{d_k}}\right)V.
+\end{equation}
+Fitur titik diurutkan menggunakan kode spasial sebelum dibagi menjadi
+patch. Flash Attention digunakan untuk menghitung attention pada pipeline
+aktif. Koordinat juga memengaruhi grid, ordering dan conditional positional
+encoding (CPE). Pada konfigurasi ini relative positional encoding eksplisit
+dinonaktifkan, yaitu \kode{enable_rpe=False}.
+
+\section{Metodologi Eksperimen}
+\subsection{Dataset dan pembagian data}
+Training set ModelNet40 terdiri atas 9.843 objek. Program
+\path{tools/create_modelnet_subset.py} memilih sekitar 10\% objek dari
+setiap kelas secara acak dengan seed 42 dan pembulatan ke atas,
+menghasilkan 1.000 objek (sekitar 10,16\% dari training set asli).
+Program \path{tools/split_modelnet_train_val.py} membagi subset tersebut
+secara stratified sekitar 80:20 dengan pembulatan per kelas.
+\begin{table}[htbp]
+\centering
+\caption{Pembagian dataset yang tetap untuk seluruh eksperimen.}
+\begin{tabular}{lrl}
+\toprule
+Bagian & Objek & Nama split \\
+\midrule
+Training & 798 & \kode{train10_train} \\
+Validation & 202 & \kode{train10_val} \\
+Official test & 2.468 & \kode{test} \\
+\bottomrule
+\end{tabular}
+\end{table}
+Seluruh 40 kelas terwakili pada training dan validation. Kedua split tidak
+beririsan dan gabungannya sama dengan subset awal. Official test juga
+terpisah dari keduanya. Stratified random sampling mempertahankan
+distribusi kelas secara mendekati, tetapi tidak menjamin seluruh variasi
+geometri intra-kelas terwakili.
+
+Pada level titik, farthest point sampling (FPS) mereduksi setiap objek
+menjadi 1.024 titik sebelum transformasi grid. Ini berbeda dari pemilihan
+subset antarobjek. Grid sampling selanjutnya dapat mengurangi jumlah
+titik aktual yang masuk ke model.
+
+\subsection{Lingkungan dan konfigurasi tetap}
+Eksperimen dijalankan pada laptop dengan GPU NVIDIA GeForce RTX 3060
+Laptop dan VRAM 6 GB. Environment yang digunakan adalah
+\kode{pointcept-torch2.5.0-cu12.4}: Python 3.10, PyTorch 2.5.0 dengan
+CUDA 12.4, spconv 2.3.8, Flash Attention 2.7.4.post1, dan torch-scatter
+2.1.2. Versi ini berasal dari pemeriksaan environment proyek.
+
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Parameter & Nilai \\
+\midrule
+Backbone / task & PT-v3m1 / DefaultClassifier, 40 kelas \\
+Mode & Encoder-only, \kode{enc_mode=True} \\
+Jumlah parameter & 38.842.792 berdasarkan log \\
+Input features & Koordinat XYZ dan normal XYZ, total 6 channel \\
+Seed model / split & 42 / 42 \\
+Epoch / eval\_epoch & 100 / 100; train.loop = 1 \\
+Batch train / validation & 4 / 8 \\
+Worker & 2 \\
+Optimizer & AdamW; LR dasar 0,001; weight decay 0,01 \\
+LR kelompok block & 0,0001; sesuai \kode{param_dicts} \\
+Scheduler & OneCycleLR; max LR kelompok 0,001 dan 0,0001 \\
+Loss & Cross Entropy + Lovasz multiclass, masing-masing bobot 1 \\
+Ordering & z, z-trans, hilbert, hilbert-trans; shuffle aktif \\
+Regularisasi & drop\_path = 0,3; attention dropout = 0 \\
+Flash / AMP & Flash Attention aktif; AMP global nonaktif \\
+\bottomrule
+\end{tabularx}
+Meskipun AMP global nonaktif, implementasi Flash Attention mengonversi
+QKV ke dtype yang didukung kernel di dalam modul attention.
+
+\subsection{Variabel tuning dan kontrol}
+Variabel yang diubah adalah \kode{enc_patch_size}, diterapkan sama pada
+kelima stage encoder. Nilai kandidat adalah 128, 256, dan 512;
+baseline menggunakan 1024. Semua model dimulai dari random initialization
+tanpa memuat checkpoint baseline. Dataset, optimizer, scheduler, seed,
+jumlah epoch, ordering, dan parameter model lainnya tetap.
+
+Untuk mencegah testing otomatis selama tuning, config induk
+\kode{cls-ptv3-v1m1-0-laptop-tuning.py} menghilangkan hook
+\kode{PreciseEvaluator}. Validation dan checkpoint tetap berjalan.
+Baseline sebelumnya memang menjalankan official test setelah training,
+tetapi angka official test tidak digunakan untuk memilih patch size.
+
+\subsection{Metrik dan durasi}
+Metrik pemilihan model adalah overall accuracy pada validation:
+\begin{equation}
+\mathrm{allAcc}=\frac{\sum_{c=1}^{40}n_{c,\mathrm{correct}}}
+{\sum_{c=1}^{40}n_c},\qquad
+\mathrm{mAcc}=\frac{1}{40}\sum_{c=1}^{40}
+\frac{n_{c,\mathrm{correct}}}{n_c}.
+\end{equation}
+Macro F1 merupakan rata-rata F1 per kelas. Setiap model dipilih pada epoch
+dengan validation allAcc tertinggi; jika skor sama, tabel menggunakan
+kemunculan pertama. mAcc dan macro F1 dilaporkan pada epoch terpilih,
+bukan maksimum terpisah sepanjang training.
+
+Durasi dihitung dari timestamp \kode{Start Training} sampai hasil
+validation epoch ke-100. Durasi mencakup training dan validation berkala,
+tetapi tidak mencakup persiapan dataset, voting test, atau penulisan
+checkpoint terakhir setelah validation. Durasi bukan benchmark inference.
+
+\section{Hasil Eksperimen}
+Semua run selesai 100 epoch tanpa error yang tercatat di log. Setiap run
+menghasilkan \kode{model_best.pth} dan \kode{model_last.pth}.
+\begin{table}[htbp]
+\centering
+\caption{Hasil pada validation set. Seluruh skor dalam persen.}
+\label{tab:results}
+\begin{tabular}{rrrrrl}
+\toprule
+Patch & allAcc & mAcc & Macro F1 & Epoch & Durasi \\
+\midrule
+1024 & \textbf{75,25} & 60,81 & 57,50 & 73 & 47 m 36 d \\
+128  & 73,76 & 57,39 & 53,08 & 83 & 47 m 15 d \\
+256  & 74,75 & \textbf{61,14} & 57,45 & 80 & 47 m 55 d \\
+512  & 74,26 & 60,75 & \textbf{58,90} & 95 & 48 m 25 d \\
+\bottomrule
+\end{tabular}
+\end{table}
+Pada tabel, m dan d berarti menit dan detik; waktu dibulatkan ke detik
+terdekat. Skor dibulatkan dari log. Dengan 202 objek validation, jumlah
+prediksi benar pada epoch terbaik adalah 152, 149, 151, dan 150 untuk
+patch 1024, 128, 256, dan 512 secara berurutan.
+
+\section{Analisis dan Keterbatasan}
+\subsection{Akurasi}
+Baseline patch 1024 memberikan allAcc tertinggi. Patch 128, 256, dan
+512 lebih rendah sekitar 1,49; 0,50; dan 0,99 poin persentase.
+Patch 256 menjadi kandidat tuning paling dekat dengan baseline, dan
+mAcc-nya sedikit lebih tinggi. Patch 512 memiliki macro F1 tertinggi,
+menunjukkan bahwa peringkat konfigurasi dapat berbeda menurut metrik.
+Pemilihan utama tetap mengikuti allAcc yang telah ditetapkan.
+
+Satu prediksi benar tambahan pada validation set mengubah allAcc sebesar
+$100/202\approx0,495$ poin persentase. Selisih baseline dan patch 256
+hanya satu objek. Oleh karena itu, hasil ini tidak cukup untuk membuktikan
+superioritas statistik konfigurasi tertentu.
+
+\subsection{Efisiensi}
+Durasi seluruh run berada pada rentang 47 menit 15 detik sampai
+48 menit 25 detik. Patch 128 sekitar 21 detik lebih cepat dari baseline,
+sedangkan patch 256 dan 512 sedikit lebih lambat. Pengecilan patch belum
+memberikan penghematan waktu training yang berarti pada pengukuran ini.
+
+Hipotesis penjelasannya adalah bahwa input hanya 1.024 titik dan pooling
+mengurangi jumlah titik pada stage berikutnya; sebagian stage mungkin
+memiliki jumlah titik di bawah batas patch. Selain itu, durasi total
+dipengaruhi sparse convolution, DataLoader, validation, dan penyimpanan
+checkpoint, bukan attention saja. Hipotesis ini memerlukan profiling
+untuk dibuktikan. Kompleksitas attention konvensional per patch
+$O(P^2)$ tidak langsung menentukan keseluruhan waktu pipeline Flash
+Attention pada eksperimen ini.
+
+\subsection{Batas validitas}
+\begin{enumerate}
+\item Seluruh konfigurasi baru diuji dengan satu seed training.
+\item Validation set kecil, khususnya kelas minoritas yang hanya memiliki
+      satu sampai beberapa objek; mAcc dapat berfluktuasi.
+\item Subset mempertahankan distribusi kelas, bukan jaminan keragaman
+      geometri lengkap dari dataset asli.
+\item Waktu diukur dari log pada sesi berbeda, tanpa kontrol ketat suhu,
+      daya GPU, dan proses latar belakang.
+\item Peak VRAM, latency inference, dan profiler attention belum diukur.
+\item Kurva learning dan confusion matrix belum dianalisis dalam laporan
+      ini. Tidak disajikan grafik sintetis atau data yang belum diekstrak.
+\end{enumerate}
+Angka hasil tidak dapat langsung dibandingkan dengan benchmark paper PTv3
+karena dataset, subset, tugas, dan protokol eksperimennya berbeda.
+
+\section{Kesimpulan dan Rencana Selanjutnya}
+Pipeline program telah dipetakan dari peluncur training sampai dataset,
+backbone, classification head, loss, update bobot, validation, dan
+checkpoint. Eksperimen ini berhasil menguji satu hyperparameter dengan
+kondisi lain tetap dan tanpa official test otomatis pada run tuning.
+
+Pengecilan patch belum meningkatkan validation allAcc maupun memberi
+percepatan total yang berarti. Baseline 1024 tetap menjadi kontrol utama.
+Patch 256 disimpan sebagai kandidat konfirmasi karena hasilnya dekat
+dengan baseline dan mAcc sedikit lebih tinggi. Temuan ini merupakan
+hasil sementara, bukan klaim bahwa patch 1024 selalu optimal.
+
+Rencana selanjutnya:
+\begin{enumerate}
+\item Menguji ordering Z, Hilbert, dan kombinasi Z+Hilbert dengan patch
+      1024 serta parameter lain tetap.
+\item Mengulangi baseline dan konfigurasi menjanjikan dengan seed 123
+      dan 501; melaporkan mean dan standard deviation.
+\item Mengekstrak kurva loss/validation dan memprofilkan komponen waktu
+      serta penggunaan VRAM.
+\item Melakukan tuning learning rate/regularisasi setelah ablation utama.
+\item Melakukan fine-tuning hanya setelah sumber pretrained checkpoint
+      dan protokol pembanding ditetapkan.
+\item Menjalankan official test pada model terpilih dengan aturan voting
+      yang sama dan telah ditetapkan; tidak memilih hasil voting berdasarkan
+      skor test tertinggi saja.
+\end{enumerate}
+
+\appendix
+\section{Artefak dan Reproduksi}
+Root repository: \path{/home/shane/Pointcept}. Commit Git sebagai referensi
+source upstream:
+\path{9f37497e4f3005c90bbbe7221b86439c29d60611}.
+Config dan program split tambahan merupakan file lokal; commit upstream
+saja tidak cukup untuk mereproduksi seluruh eksperimen.
+
+\begin{longtable}{L{0.19\linewidth}L{0.73\linewidth}}
+\toprule
+Run & Log hasil (relatif terhadap root) \\
+\midrule
+Baseline & \path{exp/modelnet40/baseline-10pct-split/train.log} \\
+Patch 128 & \path{exp/modelnet40/tuning-patch128-s42/train.log} \\
+Patch 256 & \path{exp/modelnet40/tuning-patch256-s42/train.log} \\
+Patch 512 & \path{exp/modelnet40/tuning-patch512-s42/train.log} \\
+\bottomrule
+\end{longtable}
+Setiap folder run menyimpan \kode{config.py}, \kode{code/}, event
+TensorBoard, dan folder \kode{model/}. Salinan config pada folder run
+merupakan sumber pengaturan aktual; snapshot kode merupakan sumber
+implementasi aktual saat eksperimen dijalankan.
+
+\begin{lstlisting}[language=bash]
+conda activate pointcept-torch2.5.0-cu12.4
+sh scripts/train.sh -g 1 -d modelnet40 \
+  -c cls-ptv3-v1m1-0-laptop-patch128 \
+  -n tuning-patch128-s42
+\end{lstlisting}
+Untuk patch 256 dan 512, ganti angka 128 pada config dan nama run.
+Gunakan nama run baru jika mengulang eksperimen agar hasil lama tidak
+tertimpa. Jangan menjalankan beberapa training bersamaan pada GPU laptop.
+
+\section{Informasi Hasil Official Test Baseline}
+Log baseline mencatat evaluasi official test sesudah training dengan
+10 voting evaluation. Record terbaik yang dilaporkan program adalah
+allAcc 74,96\% dan mAcc 61,20\%; evaluasi terakhir menghasilkan
+allAcc 74,55\% dan mAcc 60,61\%. Angka record terbaik ini adalah statistik
+yang dicatat program, bukan hasil protokol final yang memilih voting
+tanpa melihat label test. Angka tersebut tidak digunakan dalam tabel
+ablation patch maupun untuk memilih konfigurasi tuning.
+
+\begin{thebibliography}{9}
+\bibitem{ptv3}
+X. Wu, L. Jiang, P.-S. Wang, Z. Liu, X. Liu, Y. Qiao, W. Ouyang,
+T. He, dan H. Zhao.
+\textit{Point Transformer V3: Simpler, Faster, Stronger}.
+CVPR, 2024. \url{https://arxiv.org/abs/2312.10035}.
+\bibitem{pointcept}
+Pointcept contributors. \textit{Pointcept: A Codebase for Point Cloud
+Perception}. Repository source code.
+\url{https://github.com/Pointcept/Pointcept}.
+\bibitem{local}
+Artefak eksperimen lokal. Config, snapshot source, checkpoint, dan log
+baseline serta tuning patch size, 13--15 September 2026.
+Path artefak dicantumkan pada Lampiran A.
+\end{thebibliography}
+\end{document}
