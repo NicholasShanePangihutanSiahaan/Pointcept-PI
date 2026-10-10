@@ -545,6 +545,8 @@ class PointTransformerV3(PointModule):
         drop_path=0.3,
         pre_norm=True,
         shuffle_orders=True,
+        pool_shuffle_orders=True,
+        enc_order_indices=None,
         enable_rpe=False,
         enable_flash=True,
         upcast_attention=False,
@@ -562,12 +564,23 @@ class PointTransformerV3(PointModule):
         self.order = [order] if isinstance(order, str) else order
         self.enc_mode = enc_mode
         self.shuffle_orders = shuffle_orders
+        self.pool_shuffle_orders = pool_shuffle_orders
+        self.enc_order_indices = enc_order_indices
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
         assert self.num_stages == len(enc_channels)
         assert self.num_stages == len(enc_num_head)
         assert self.num_stages == len(enc_patch_size)
+        if self.enc_order_indices is not None:
+            assert len(self.enc_order_indices) == self.num_stages, (
+                "enc_order_indices must contain one order index per encoder stage"
+            )
+            assert all(
+                isinstance(order_index, int)
+                and 0 <= order_index < len(self.order)
+                for order_index in self.enc_order_indices
+            ), "enc_order_indices contains an invalid serialization order index"
         assert self.enc_mode or self.num_stages == len(dec_depths) + 1
         assert self.enc_mode or self.num_stages == len(dec_channels) + 1
         assert self.enc_mode or self.num_stages == len(dec_num_head) + 1
@@ -624,6 +637,7 @@ class PointTransformerV3(PointModule):
                         stride=stride[s - 1],
                         norm_layer=bn_layer,
                         act_layer=act_layer,
+                        shuffle_orders=self.pool_shuffle_orders,
                     ),
                     name="down",
                 )
@@ -642,7 +656,11 @@ class PointTransformerV3(PointModule):
                         norm_layer=ln_layer,
                         act_layer=act_layer,
                         pre_norm=pre_norm,
-                        order_index=i % len(self.order),
+                        order_index=(
+                            self.enc_order_indices[s]
+                            if self.enc_order_indices is not None
+                            else i % len(self.order)
+                        ),
                         cpe_indice_key=f"stage{s}",
                         enable_rpe=enable_rpe,
                         enable_flash=enable_flash,
